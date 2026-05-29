@@ -1,6 +1,6 @@
 # To-Do Menu
 
-MacOS menu bar to-do scratchpad. Add ToDoMenu.app folder into Applications to install.
+MacOS menu bar to-do scratchpad. Unzip ToDoMenu.zip into Applications to install.
 
 ---
 
