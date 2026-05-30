@@ -81,16 +81,11 @@ struct TaskPopoverView: View {
                                         commitInlineEdit(id: task.id)
                                         handleRowArrowMove(direction: .up, currentTaskId: task.id)
                                     },
-                                    // Shift + Arrow arrangement event hooks
                                     onShiftDownArrow: {
-                                        if let currentIndex = store.tasks.firstIndex(where: { $0.id == task.id }) {
-                                            moveTaskDelta(fromIndex: currentIndex, direction: .down)
-                                        }
+                                        moveTaskDelta(taskId: task.id, direction: .down)
                                     },
                                     onShiftUpArrow: {
-                                        if let currentIndex = store.tasks.firstIndex(where: { $0.id == task.id }) {
-                                            moveTaskDelta(fromIndex: currentIndex, direction: .up)
-                                        }
+                                        moveTaskDelta(taskId: task.id, direction: .up)
                                     },
                                     onDeleteKey: {
                                         deleteAndMoveSelection(task)
@@ -119,17 +114,14 @@ struct TaskPopoverView: View {
                                 commitAnyActiveEdits()
                                 selectedTaskId = task.id
                                 focusedField = .row(id: task.id)
-                                // Treat a mouse click as an intentional placement to preserve text or append
                                 clearedTaskIds.insert(task.id)
                             }
-                            // Drag and drop modifiers attached directly onto the structural row wrapper
                             .onDrag {
                                 commitAnyActiveEdits()
                                 self.draggingTask = task
                                 return NSItemProvider(object: task.id.uuidString as NSString)
                             }
                             .onDrop(of: [.text], delegate: TaskDropDelegate(item: task, store: store, currentDraggingItem: $draggingTask))
-                            // Assign an explicit ID anchor mapping for target view scrolls
                             .id(task.id)
                             
                             if index < store.tasks.count - 1 {
@@ -218,7 +210,6 @@ struct TaskPopoverView: View {
             .background(Color.primary.opacity(0.02))
         }
         .padding(.vertical, 2)
-        // Clean rounded edges applied directly onto content with vibrant vibrancy effects
         .background(VisualEffectBlur(material: .hudWindow, blendingMode: .behindWindow))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
@@ -226,13 +217,11 @@ struct TaskPopoverView: View {
                 .stroke(.white.opacity(0.12), lineWidth: 0.5)
                 .blendMode(.overlay)
         )
-        // Forces keyboard state to lock onto the input box automatically on click/hotkey display events
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
             commitAnyActiveEdits()
             selectedTaskId = nil
             focusedField = .inputField
         }
-        // Listen for the Option + W shortcut forwarded from HotKey inside AppDelegate
         .onReceive(NotificationCenter.default.publisher(for: .requestHotkeyPinToggle)) { _ in
             togglePin()
         }
@@ -267,7 +256,7 @@ struct TaskPopoverView: View {
 
     private func commitInlineEdit(id: UUID) {
         guard let index = store.tasks.firstIndex(where: { $0.id == id }) else { return }
-        clearedTaskIds.remove(id) // Reset selection track flags safely
+        clearedTaskIds.remove(id)
         
         if let currentText = taskTexts[id] {
             let cleanText = currentText.trimmingCharacters(in: .whitespaces)
@@ -292,10 +281,7 @@ struct TaskPopoverView: View {
     }
 
     private func handleRowArrowMove(direction: MoveCommandDirection, currentTaskId: UUID) {
-        // Resolve index dynamically from the data state directly, rather than passing a static ForEach value
-        guard let currentIndex = store.tasks.firstIndex(where: { $0.id == currentTaskId }) else {
-            return
-        }
+        guard let currentIndex = store.tasks.firstIndex(where: { $0.id == currentTaskId }) else { return }
 
         switch direction {
         case .down:
@@ -321,9 +307,8 @@ struct TaskPopoverView: View {
         }
     }
     
-    // Handles Shift + Arrow structural indexing mutations safely
-    private func moveTaskDelta(fromIndex: Int, direction: MoveCommandDirection) {
-        guard fromIndex >= 0 && fromIndex < store.tasks.count else { return }
+    private func moveTaskDelta(taskId: UUID, direction: MoveCommandDirection) {
+        guard let fromIndex = store.tasks.firstIndex(where: { $0.id == taskId }) else { return }
 
         let toIndex: Int
         if direction == .down {
@@ -334,31 +319,27 @@ struct TaskPopoverView: View {
             guard toIndex >= 0 else { return }
         }
         
-        let activeTaskId = store.tasks[fromIndex].id
-        commitInlineEdit(id: activeTaskId)
+        commitInlineEdit(id: taskId)
         
         withAnimation(.spring(response: 0.22, dampingFraction: 0.82)) {
             store.tasks.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: direction == .down ? toIndex + 1 : toIndex)
             store.save()
         }
         
-        // Keep focus locked securely on the moved item
-        selectedTaskId = activeTaskId
-        focusedField = .row(id: activeTaskId)
-        clearedTaskIds.insert(activeTaskId)
+        selectedTaskId = taskId
+        focusedField = .row(id: taskId)
+        clearedTaskIds.insert(taskId)
     }
     
     private func deleteAndMoveSelection(_ task: Task) {
         guard let index = store.tasks.firstIndex(where: { $0.id == task.id }) else { return }
         
-        // 1. HARD RESIGN APPKIT FOCUS: Clear responders safely
         NSApp.keyWindow?.makeFirstResponder(nil)
         focusedField = nil
         
         taskTexts.removeValue(forKey: task.id)
         clearedTaskIds.remove(task.id)
         
-        // 2. Derive the fallback focus destination ahead of mutating the collection
         let nextTargetId: UUID?
         if store.tasks.count <= 1 {
             nextTargetId = nil
@@ -368,12 +349,10 @@ struct TaskPopoverView: View {
             nextTargetId = store.tasks[index + 1].id
         }
         
-        // 3. Perform removal mutation smoothly inside the animation engine
         withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
             store.delete(task)
         }
         
-        // 4. Delay the target focus assignment to the next event loop run tick
         DispatchQueue.main.async {
             if let targetId = nextTargetId {
                 self.selectedTaskId = targetId
@@ -453,9 +432,8 @@ struct CustomMacTextField: NSViewRepresentable {
             nsView.stringValue = text
         }
         
-        // Clear active textual highlighting selections upon rendering re-arranged indices
         if let currentEditor = nsView.currentEditor() as? NSTextView {
-            if currentEditor.selectedRange().length > 0 {
+            if currentEditor.selectedRange().length > 0 && !isEditingEnabled {
                 currentEditor.setSelectedRange(NSRange(location: currentEditor.selectedRange().location, length: 0))
             }
         }
@@ -478,17 +456,18 @@ struct CustomMacTextField: NSViewRepresentable {
             }
         }
 
+        // INTERCEPTING APP-KIT SELECTORS: Bypasses standard text selection for structural shifts
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.moveDown(_:)) {
                 parent.onDownArrow()
                 return true
-            } else if commandSelector == Selector("selectDown:") {
+            } else if commandSelector == #selector(NSResponder.moveDownAndModifySelection(_:)) || commandSelector == Selector("selectDown:") {
                 parent.onShiftDownArrow()
                 return true
             } else if commandSelector == #selector(NSResponder.moveUp(_:)) {
                 parent.onUpArrow()
                 return true
-            } else if commandSelector == Selector("selectUp:") {
+            } else if commandSelector == #selector(NSResponder.moveUpAndModifySelection(_:)) || commandSelector == Selector("selectUp:") {
                 parent.onShiftUpArrow()
                 return true
             } else if commandSelector == #selector(NSResponder.insertNewline(_:)) {
