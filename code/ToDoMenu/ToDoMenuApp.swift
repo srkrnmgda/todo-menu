@@ -22,20 +22,15 @@ struct TaskSlabApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem!
     var panel: CustomPanel!
+    var settingsWindow: NSWindow?
     var taskStore = TaskStore()
     
-    // Global hotkey to toggle panel open/closed
     var globalHotKey: HotKey?
-    // Focused hotkey to toggle pin/unpin status
     var localPinHotKey: HotKey?
-    
-    private var localMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        
         try? SMAppService.mainApp.register()
         
-        // 1. Setup Status Bar Button
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "checklist", accessibilityDescription: "Tasks")
@@ -44,101 +39,127 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             button.target = self
         }
 
-        // 2. Build the Custom Glass Panel Canvas
         panel = CustomPanel(
             contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        
-        panel.isFloatingPanel = true
+        panel.isMovableByWindowBackground = false
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.title = "TaskSlab"
-        panel.delegate = self
-        
-        // Make the window transparent so clipped SwiftUI layouts don't bleed gray rectangular shadow borders
-        panel.isOpaque = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        panel.delegate = self
         
         let contentView = TaskPopoverView(store: taskStore)
         panel.contentView = NSHostingView(rootView: contentView)
         
-        // Update menu badge count initially
-        updateMenuBarButton()
+        setupHotKeys()
+        updateMenuBadge()
         
-        // 3. Global Option + T Key Binding
-        globalHotKey = HotKey(key: .t, modifiers: [.option])
-        globalHotKey?.keyDownHandler = { [weak self] in
-            self?.togglePanel()
-        }
-        
-        // 4. Focused-Only Option + W Pin Binding
-        localPinHotKey = HotKey(key: .w, modifiers: [.option])
-        localPinHotKey?.keyDownHandler = { [weak self] in
-            guard let self = self else { return }
-            // Only trigger pinning if the app panel is actively focused
-            if self.panel.isKeyWindow {
-                NotificationCenter.default.post(name: .requestHotkeyPinToggle, object: nil)
-            }
-        }
-
-        // Listen for user interaction events from the view hierarchy
         NotificationCenter.default.addObserver(self, selector: #selector(handlePinToggle(_:)), name: .toggleWindowPin, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(handleDataChanged), name: .taskDataChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(updateMenuBadge), name: .taskDataChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(openSettingsWindow), name: .requestOpenSettings, object: nil)
+        
+        // Listen for user customization revisions inside the Preferences Recorder View
+        NotificationCenter.default.addObserver(self, selector: #selector(setupHotKeys), name: Notification.Name("updateGlobalHotkeyBinding"), object: nil)
     }
     
-    @objc func togglePanel() {
-        if panel.isVisible && panel.isKeyWindow {
-            if !panel.isPinned {
-                panel.orderOut(nil)
+    @objc func openSettingsWindow() {
+        if let existing = settingsWindow {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        
+        let settingsView = SettingsView(store: taskStore)
+        let hostingView = NSHostingView(rootView: settingsView)
+        
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.center()
+        window.title = "To-Do Menu Preferences"
+        window.contentView = hostingView
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        
+        self.settingsWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    
+    func windowWillClose(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window == settingsWindow {
+            settingsWindow = nil
+        }
+    }
+
+    @objc private func setupHotKeys() {
+        // Tear down any active carbon listener context prior to binding new variants
+        globalHotKey = nil
+        
+        // Map saved UserDefault primitives explicitly into framework objects
+        if let appKitKey = Key(carbonKeyCode: UInt32(taskStore.globalKeyCode)) {
+            let appKitModifiers = NSEvent.ModifierFlags(rawValue: taskStore.globalModifiersFlags)
+            var hotkeyKitModifiers: NSEvent.ModifierFlags = []
+            
+            if appKitModifiers.contains(.control) { hotkeyKitModifiers.insert(.control) }
+            if appKitModifiers.contains(.option)  { hotkeyKitModifiers.insert(.option) }
+            if appKitModifiers.contains(.shift)   { hotkeyKitModifiers.insert(.shift) }
+            if appKitModifiers.contains(.command) { hotkeyKitModifiers.insert(.command) }
+            
+            globalHotKey = HotKey(key: appKitKey, modifiers: hotkeyKitModifiers)
+            globalHotKey?.keyDownHandler = { [weak self] in
+                self?.togglePanel()
             }
+        }
+        
+        // Keep the local, static window-pin modifier active
+        localPinHotKey = HotKey(key: .w, modifiers: [.option])
+        localPinHotKey?.keyDownHandler = {
+            NotificationCenter.default.post(name: .requestHotkeyPinToggle, object: nil)
+        }
+    }
+
+    @objc func handlePinToggle(_ notification: Notification) {
+        guard let isPinned = notification.object as? Bool else { return }
+        panel.isPinned = isPinned
+        panel.level = isPinned ? .floating : .statusBar
+    }
+
+    @objc func togglePanel() {
+        if panel.isVisible {
+            panel.orderOut(nil)
         } else {
-            // Place panel elegantly below the status bar icon
             if let button = statusItem.button, let windowScreen = button.window?.screen {
-                let buttonFrame = button.window?.convertToScreen(button.frame) ?? .zero
-                let screenFrame = windowScreen.visibleFrame
+                let buttonFrame = button.window!.convertToScreen(button.frame)
+                let screenFrame = windowScreen.frame
                 
-                let panelWidth: CGFloat = 320
-                let panelHeight = panel.frame.height
+                let panelWidth = panel.frame.width
+                var panelX = buttonFrame.origin.x + (buttonFrame.width / 2) - (panelWidth / 2)
                 
-                var xPos = buttonFrame.origin.x + (buttonFrame.width / 2) - (panelWidth / 2)
-                if xPos + panelWidth > screenFrame.maxX {
-                    xPos = screenFrame.maxX - panelWidth - 10
-                } else if xPos < screenFrame.minX {
-                    xPos = screenFrame.minX + 10
+                if panelX + panelWidth > screenFrame.origin.x + screenFrame.width {
+                    panelX = screenFrame.origin.x + screenFrame.width - panelWidth - 12
+                }
+                if panelX < screenFrame.origin.x {
+                    panelX = screenFrame.origin.x + 12
                 }
                 
-                let yPos = buttonFrame.origin.y - panelHeight - 4
+                let panelY = buttonFrame.origin.y - panel.frame.height - 4
                 
-                panel.setFrame(NSRect(x: xPos, y: yPos, width: panelWidth, height: panelHeight), display: true)
+                panel.setFrameOrigin(NSPoint(x: panelX, y: panelY))
             }
-            
             panel.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
     }
-    
-    @objc private func handlePinToggle(_ notification: Notification) {
-        if let isPinned = notification.object as? Bool {
-            panel.isPinned = isPinned
-            panel.level = isPinned ? .floating : .statusBar
-            
-            if isPinned {
-                panel.styleMask.insert(.resizable)
-            } else {
-                panel.styleMask.remove(.resizable)
-            }
-        }
-    }
-    
-    @objc private func handleDataChanged() {
-        updateMenuBarButton()
-    }
-    
-    private func updateMenuBarButton() {
+
+    @objc func updateMenuBadge() {
         guard let button = statusItem.button else { return }
         let count = taskStore.tasks.count
         
@@ -151,13 +172,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window == settingsWindow { return }
         if !panel.isPinned {
             panel.orderOut(nil)
         }
     }
 }
-
-// MARK: - Subclassed Panel
 
 class CustomPanel: NSPanel {
     var isPinned: Bool = false
@@ -180,10 +200,9 @@ class CustomPanel: NSPanel {
     }
 }
 
-// MARK: - Global Notification Name Extensions
-
 extension Notification.Name {
     static let toggleWindowPin = Notification.Name("toggleWindowPin")
     static let taskDataChanged = Notification.Name("taskDataChanged")
     static let requestHotkeyPinToggle = Notification.Name("requestHotkeyPinToggle")
+    static let requestOpenSettings = Notification.Name("requestOpenSettings")
 }

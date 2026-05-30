@@ -9,10 +9,10 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-// Tracks keyboard focus mapping cleanly across the view hierarchy
 enum FocusField: Hashable {
     case inputField
     case row(id: UUID)
+    case markdownEditor(id: UUID)
 }
 
 struct TaskPopoverView: View {
@@ -21,108 +21,216 @@ struct TaskPopoverView: View {
     @State private var isPinned: Bool = false
     @State private var selectedTaskId: UUID?
     
-    // Tracks text alterations across specific task identifiers
+    // Markdown Note States
+    @State private var expandedNoteTaskId: UUID?
+    @State private var currentNoteText: String = ""
+    
     @State private var taskTexts: [UUID: String] = [:]
-    
-    // Tracks which rows have already processed their initial "overwrite" keystroke
     @State private var clearedTaskIds: Set<UUID> = []
-    
     @FocusState private var focusedField: FocusField?
-    
-    // State to track the item currently being dragged
     @State private var draggingTask: Task?
 
     var body: some View {
         VStack(spacing: 0) {
-            // Top structural margin
             Spacer().frame(height: 12)
 
-            // Scrollable task list with Proxy Reader Engine
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(store.tasks.enumerated()), id: \.element.id) { index, task in
-                            HStack {
-                                // Drag indicator handle
-                                Image(systemName: "line.3.horizontal")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary.opacity(0.4))
-                                    .padding(.trailing, 4)
-                                
-                                // EMBEDDED TEXT FIELD: Active but stealthy.
-                                CustomMacTextField(
-                                    text: Binding(
-                                        get: { taskTexts[task.id] ?? task.text },
-                                        set: { newValue in
-                                            let oldText = taskTexts[task.id] ?? task.text
-                                            
-                                            // Only clear the text if this is the FIRST keystroke since highlighting the row
-                                            if selectedTaskId == task.id && !clearedTaskIds.contains(task.id) {
-                                                clearedTaskIds.insert(task.id)
-                                                if newValue.count > oldText.count, let lastChar = newValue.last {
-                                                    taskTexts[task.id] = String(lastChar)
-                                                } else {
-                                                    taskTexts[task.id] = newValue
-                                                }
+                            VStack(spacing: 0) {
+                                HStack {
+                                    Image(systemName: "line.3.horizontal")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary.opacity(0.4))
+                                        .padding(.trailing, 4)
+                                    
+                                    CustomMacTextField(
+                                        text: Binding(
+                                            get: { taskTexts[task.id] ?? task.text },
+                                            set: { updateTaskText(for: task.id, newValue: $0) }
+                                        ),
+                                        placeholder: "Edit task…",
+                                        fontDesignRounded: true,
+                                        isEditingEnabled: clearedTaskIds.contains(task.id),
+                                        onDownArrow: {
+                                            commitInlineEdit(id: task.id)
+                                            handleRowArrowMove(direction: .down, currentTaskId: task.id)
+                                        },
+                                        onUpArrow: {
+                                            commitInlineEdit(id: task.id)
+                                            handleRowArrowMove(direction: .up, currentTaskId: task.id)
+                                        },
+                                        onShiftDownArrow: {
+                                            if expandedNoteTaskId == task.id {
+                                                commitInlineEdit(id: task.id)
+                                                focusedField = .markdownEditor(id: task.id)
                                             } else {
-                                                // Regular typing mode takes over completely here
-                                                taskTexts[task.id] = newValue
+                                                moveTaskDelta(taskId: task.id, direction: .down)
+                                            }
+                                        },
+                                        onShiftUpArrow: {
+                                            if index > 0 {
+                                                let previousTask = store.tasks[index - 1]
+                                                if expandedNoteTaskId == previousTask.id {
+                                                    commitInlineEdit(id: task.id)
+                                                    selectedTaskId = previousTask.id
+                                                    focusedField = .markdownEditor(id: previousTask.id)
+                                                    return
+                                                }
+                                            }
+                                            moveTaskDelta(taskId: task.id, direction: .up)
+                                        },
+                                        onCmdShiftToggle: {
+                                            toggleMarkdownNote(for: task)
+                                        },
+                                        onDeleteKey: {
+                                            deleteAndMoveSelection(task)
+                                        },
+                                        onSubmit: {
+                                            commitInlineEdit(id: task.id)
+                                        }
+                                    )
+                                    .focused($focusedField, equals: .row(id: task.id))
+                                    .frame(height: 32)
+
+                                    Spacer()
+                                    
+                                    if markdownFileExistsAndHasContent(for: task) {
+                                        Image(systemName: "doc.text.fill")
+                                            .font(.caption)
+                                            .foregroundColor(.accentColor.opacity(0.7))
+                                            .padding(.trailing, 4)
+                                    }
+
+                                    Button(action: { deleteAndMoveSelection(task) }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(.secondary)
+                                            .font(.title3)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .frame(height: 44)
+                                .padding(.horizontal, 16)
+                                .background(selectedTaskId == task.id ? Color.accentColor.opacity(0.15) : Color.clear)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    commitAnyActiveEdits()
+                                    selectedTaskId = task.id
+                                    focusedField = .row(id: task.id)
+                                    clearedTaskIds.insert(task.id)
+                                }
+                                
+                                // FIXED: Dual-state workspace utilizing ZStack layout mapping for instant focus availability
+                                if expandedNoteTaskId == task.id {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text(focusedField == .markdownEditor(id: task.id) ? "MARKDOWN EDITOR — ACTIVE" : "MARKDOWN NOTE — RENDERED")
+                                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                                .foregroundColor(focusedField == .markdownEditor(id: task.id) ? .accentColor : .secondary)
+                                            Spacer()
+                                            Text(focusedField == .markdownEditor(id: task.id) ? "Shift+↑ to exit / read" : "Click to edit")
+                                                .font(.system(size: 9, weight: .medium))
+                                                .foregroundColor(.secondary.opacity(0.6))
+                                        }
+                                        .padding(.horizontal, 16)
+                                        .padding(.top, 4)
+                                        
+                                        ZStack {
+                                            // 1. Plain Text Native Input layer
+                                            FocusableTextEditor(
+                                                text: $currentNoteText,
+                                                onEscapeUp: {
+                                                    focusedField = .row(id: task.id)
+                                                    selectedTaskId = task.id
+                                                },
+                                                onEscapeDown: {
+                                                    focusedField = .row(id: task.id)
+                                                    selectedTaskId = task.id
+                                                    handleRowArrowMove(direction: .down, currentTaskId: task.id)
+                                                },
+                                                onCmdShiftToggle: {
+                                                    toggleMarkdownNote(for: task)
+                                                }
+                                            )
+                                            .focused($focusedField, equals: .markdownEditor(id: task.id))
+                                            .opacity(focusedField == .markdownEditor(id: task.id) ? 1.0 : 0.0)
+                                            .allowsHitTesting(focusedField == .markdownEditor(id: task.id))
+                                            
+                                            // 2. FIXED: Rich Block-by-Block Markdown Render Engine
+                                            ScrollView(.vertical, showsIndicators: true) {
+                                                VStack(alignment: .leading, spacing: 6) {
+                                                    let lines = currentNoteText.components(separatedBy: .newlines)
+                                                    // Skip the first line if it's the automated "# Task Title" header
+                                                    let contentLines = lines.first?.hasPrefix("# ") == true ? Array(lines.dropFirst()) : lines
+                                                    
+                                                    if contentLines.joined(separator: "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                                        Text("*No additional scratchpad notes written yet.*")
+                                                            .font(.system(size: 13))
+                                                            .foregroundColor(.secondary.opacity(0.6))
+                                                            .padding(.vertical, 4)
+                                                    } else {
+                                                        ForEach(Array(contentLines.enumerated()), id: \.offset) { _, line in
+                                                            let trimmed = line.trimmingCharacters(in: .whitespaces)
+                                                            
+                                                            if trimmed == "---" || trimmed == "***" {
+                                                                Divider()
+                                                                    .padding(.vertical, 4)
+                                                            } else if trimmed.hasPrefix("# ") {
+                                                                Text(LocalizedStringKey(String(trimmed.dropFirst(2))))
+                                                                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                                                                    .foregroundColor(.primary)
+                                                                    .padding(.top, 4)
+                                                            } else if trimmed.hasPrefix("## ") {
+                                                                Text(LocalizedStringKey(String(trimmed.dropFirst(3))))
+                                                                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                                                                    .foregroundColor(.primary)
+                                                                    .padding(.top, 2)
+                                                            } else if trimmed.hasPrefix("### ") {
+                                                                Text(LocalizedStringKey(String(trimmed.dropFirst(4))))
+                                                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                                                    .foregroundColor(.secondary)
+                                                            } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+                                                                HStack(alignment: .top, spacing: 6) {
+                                                                    Text("•").foregroundColor(.accentColor)
+                                                                    Text(LocalizedStringKey(String(trimmed.dropFirst(2))))
+                                                                        .font(.system(size: 13))
+                                                                }
+                                                            } else {
+                                                                // Standard line handling inline markdown strings (**bold**, *italics*)
+                                                                Text(LocalizedStringKey(line))
+                                                                    .font(.system(size: 13))
+                                                                    .foregroundColor(.primary.opacity(0.9))
+                                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                                    .fixedSize(horizontal: false, vertical: true)
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                .padding(.vertical, 4)
+                                            }
+                                            .opacity(focusedField == .markdownEditor(id: task.id) ? 0.0 : 1.0)
+                                            .allowsHitTesting(focusedField != .markdownEditor(id: task.id))
+                                            .contentShape(Rectangle())
+                                            .onTapGesture {
+                                                selectedTaskId = task.id
+                                                focusedField = .markdownEditor(id: task.id)
                                             }
                                         }
-                                    ),
-                                    placeholder: "Edit task…",
-                                    fontDesignRounded: true,
-                                    isEditingEnabled: clearedTaskIds.contains(task.id),
-                                    onDownArrow: {
-                                        commitInlineEdit(id: task.id)
-                                        handleRowArrowMove(direction: .down, currentTaskId: task.id)
-                                    },
-                                    onUpArrow: {
-                                        commitInlineEdit(id: task.id)
-                                        handleRowArrowMove(direction: .up, currentTaskId: task.id)
-                                    },
-                                    onShiftDownArrow: {
-                                        moveTaskDelta(taskId: task.id, direction: .down)
-                                    },
-                                    onShiftUpArrow: {
-                                        moveTaskDelta(taskId: task.id, direction: .up)
-                                    },
-                                    onDeleteKey: {
-                                        deleteAndMoveSelection(task)
-                                    },
-                                    onSubmit: {
-                                        commitInlineEdit(id: task.id)
+                                        .frame(height: 110)
+                                        .padding(.horizontal, 16)
+                                        .padding(.bottom, 8)
                                     }
-                                )
-                                .focused($focusedField, equals: .row(id: task.id))
-                                .frame(height: 32)
-
-                                Spacer()
-
-                                Button(action: { deleteAndMoveSelection(task) }) {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundColor(.secondary)
-                                        .font(.title3)
+                                    .transition(.move(edge: .top).combined(with: .opacity))
                                 }
-                                .buttonStyle(.plain)
                             }
-                            .frame(height: 44)
-                            .padding(.horizontal, 16)
-                            .background(selectedTaskId == task.id ? Color.accentColor.opacity(0.15) : Color.clear)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                commitAnyActiveEdits()
-                                selectedTaskId = task.id
-                                focusedField = .row(id: task.id)
-                                clearedTaskIds.insert(task.id)
-                            }
+                            .id(task.id)
                             .onDrag {
                                 commitAnyActiveEdits()
                                 self.draggingTask = task
                                 return NSItemProvider(object: task.id.uuidString as NSString)
                             }
                             .onDrop(of: [.text], delegate: TaskDropDelegate(item: task, store: store, currentDraggingItem: $draggingTask))
-                            .id(task.id)
                             
                             if index < store.tasks.count - 1 {
                                 Divider()
@@ -132,7 +240,7 @@ struct TaskPopoverView: View {
                         }
                     }
                 }
-                .onChange(of: selectedTaskId) { oldValue, newValue in
+                .onChange(of: selectedTaskId) { _, newValue in
                     if let targetId = newValue {
                         withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
                             proxy.scrollTo(targetId, anchor: .center)
@@ -173,6 +281,7 @@ struct TaskPopoverView: View {
                     },
                     onShiftDownArrow: {},
                     onShiftUpArrow: {},
+                    onCmdShiftToggle: {},
                     onDeleteKey: {},
                     onSubmit: {
                         addTask()
@@ -186,7 +295,7 @@ struct TaskPopoverView: View {
             
             Divider().opacity(0.3)
             
-            // Pin Button Cell
+            // Footer Action Toolbar
             HStack {
                 Spacer()
                 Button(action: togglePin) {
@@ -205,6 +314,14 @@ struct TaskPopoverView: View {
                 }
                 .buttonStyle(.plain)
                 Spacer()
+                
+                Button(action: { NotificationCenter.default.post(name: .requestOpenSettings, object: nil) }) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.title3)
+                        .foregroundColor(.primary.opacity(0.5))
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 16)
             }
             .frame(height: 44)
             .background(Color.primary.opacity(0.02))
@@ -225,8 +342,20 @@ struct TaskPopoverView: View {
         .onReceive(NotificationCenter.default.publisher(for: .requestHotkeyPinToggle)) { _ in
             togglePin()
         }
-        .onAppear {
-            focusedField = .inputField
+        .onPlaySound()
+    }
+
+    private func updateTaskText(for taskId: UUID, newValue: String) {
+        let oldText = taskTexts[taskId] ?? (store.tasks.first(where: { $0.id == taskId })?.text ?? "")
+        if selectedTaskId == taskId && !clearedTaskIds.contains(taskId) {
+            clearedTaskIds.insert(taskId)
+            if newValue.count > oldText.count, let lastChar = newValue.last {
+                taskTexts[taskId] = String(lastChar)
+            } else {
+                taskTexts[taskId] = newValue
+            }
+        } else {
+            taskTexts[taskId] = newValue
         }
     }
 
@@ -247,13 +376,72 @@ struct TaskPopoverView: View {
     
     private func calculateListHeight() -> CGFloat {
         if store.tasks.isEmpty { return 0 }
-        let calculatedHeight = CGFloat(store.tasks.count * 44) + CGFloat(max(0, store.tasks.count - 1) * 1)
-        let maxHeight = (NSScreen.main?.visibleFrame.height ?? 800) * 0.4
-        return min(calculatedHeight, maxHeight)
+        let staticRowsHeight = CGFloat(store.tasks.count * 44) + CGFloat(max(0, store.tasks.count - 1) * 1)
+        let expandedNoteOffset = expandedNoteTaskId != nil ? CGFloat(132) : 0
+        let totalCalculated = staticRowsHeight + expandedNoteOffset
+        let maxHeight = (NSScreen.main?.visibleFrame.height ?? 800) * 0.5
+        return min(totalCalculated, maxHeight)
     }
     
-    // MARK: - Persistence Logic For Inline Editing
+    private func toggleMarkdownNote(for task: Task) {
+        commitAnyActiveEdits()
+        let shiftingToOpen = (expandedNoteTaskId != task.id)
+        
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+            if expandedNoteTaskId == task.id {
+                expandedNoteTaskId = nil
+                currentNoteText = ""
+            } else {
+                expandedNoteTaskId = task.id
+                currentNoteText = loadMarkdownNote(for: task)
+            }
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            if shiftingToOpen {
+                self.focusedField = .markdownEditor(id: task.id)
+            } else {
+                self.focusedField = .row(id: task.id)
+                self.selectedTaskId = task.id
+            }
+        }
+    }
+    
+    private func getMarkdownFileURL(for task: Task) -> URL {
+        return store.notesDirectoryURL.appendingPathComponent("\(task.id.uuidString).md")
+    }
+    
+    private func loadMarkdownNote(for task: Task) -> String {
+        let fileURL = getMarkdownFileURL(for: task)
+        guard let savedString = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return "# \(task.text)\n\n"
+        }
+        return savedString
+    }
+    
+    private func saveMarkdownNote(_ text: String, for task: Task) {
+        let fileURL = getMarkdownFileURL(for: task)
+        try? text.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+    
+    private func markdownFileExistsAndHasContent(for task: Task) -> Bool {
+        let fileURL = getMarkdownFileURL(for: task)
+        guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return false }
+        let lines = text.components(separatedBy: .newlines)
+        let practicalText = lines.filter { !$0.starts(with: "#") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        return !practicalText.isEmpty
+    }
 
+    private func getRenderableMarkdown(for rawText: String) -> LocalizedStringKey {
+        let lines = rawText.components(separatedBy: .newlines)
+        if let firstLine = lines.first, firstLine.hasPrefix("# ") {
+            let choppedLines = Array(lines.dropFirst())
+            let jointText = choppedLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            return LocalizedStringKey(jointText.isEmpty ? "*No additional scratchpad notes written yet.*" : jointText)
+        }
+        return LocalizedStringKey(rawText)
+    }
+    
     private func commitInlineEdit(id: UUID) {
         guard let index = store.tasks.firstIndex(where: { $0.id == id }) else { return }
         clearedTaskIds.remove(id)
@@ -268,6 +456,15 @@ struct TaskPopoverView: View {
                 withAnimation(.easeOut(duration: 0.15)) {
                     store.tasks[index] = Task(id: id, text: cleanText)
                     store.save()
+                    
+                    let task = store.tasks[index]
+                    let existingNote = loadMarkdownNote(for: task)
+                    var lines = existingNote.components(separatedBy: .newlines)
+                    if let firstLine = lines.first, firstLine.starts(with: "#") {
+                        lines[0] = "# \(cleanText)"
+                        let updatedContent = lines.joined(separator: "\n")
+                        saveMarkdownNote(updatedContent, for: task)
+                    }
                 }
             }
         }
@@ -340,6 +537,11 @@ struct TaskPopoverView: View {
         taskTexts.removeValue(forKey: task.id)
         clearedTaskIds.remove(task.id)
         
+        if expandedNoteTaskId == task.id {
+            expandedNoteTaskId = nil
+            currentNoteText = ""
+        }
+        
         let nextTargetId: UUID?
         if store.tasks.count <= 1 {
             nextTargetId = nil
@@ -365,7 +567,7 @@ struct TaskPopoverView: View {
     }
 }
 
-// MARK: - Drop Delegate Logic Engine
+// MARK: - Drop Delegate Context
 
 struct TaskDropDelegate: DropDelegate {
     let item: Task
@@ -392,7 +594,102 @@ struct TaskDropDelegate: DropDelegate {
     }
 }
 
-// MARK: - Native Intercepting TextField Wrapper
+// MARK: - AppKit Multi-line Editor Engine
+
+struct FocusableTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    var onEscapeUp: () -> Void
+    var onEscapeDown: () -> Void
+    var onCmdShiftToggle: () -> Void
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
+        
+        textView.isRichText = false
+        textView.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        if let roundedDescriptor = NSFont.systemFont(ofSize: 13, weight: .regular).fontDescriptor.withDesign(.monospaced) {
+            textView.font = NSFont(descriptor: roundedDescriptor, size: 13)
+        }
+        
+        textView.drawsBackground = false
+        textView.backgroundColor = .clear
+        textView.textColor = .labelColor
+        textView.insertionPointColor = .labelColor
+        textView.delegate = context.coordinator
+        
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let textView = nsView.documentView as? NSTextView else { return }
+        if textView.string != text {
+            textView.string = text
+        }
+        context.coordinator.setupLocalMonitor(for: textView)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: FocusableTextEditor
+        private var localMonitor: Any?
+
+        init(_ parent: FocusableTextEditor) {
+            self.parent = parent
+        }
+        
+        deinit {
+            if let monitor = localMonitor {
+                NSEvent.removeMonitor(monitor)
+            }
+        }
+        
+        func setupLocalMonitor(for textView: NSTextView) {
+            guard localMonitor == nil else { return }
+            
+            localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self = self, NSApp.keyWindow?.firstResponder == textView else { return event }
+                
+                let flags = event.modifierFlags
+                let keyCode = event.keyCode
+                
+                if flags.contains(.command) && flags.contains(.shift) {
+                    if keyCode == 126 || keyCode == 125 {
+                        self.parent.onCmdShiftToggle()
+                        return nil
+                    }
+                }
+                
+                if flags.contains(.shift) && !flags.contains(.command) {
+                    if keyCode == 126 {
+                        self.parent.onEscapeUp()
+                        return nil
+                    } else if keyCode == 125 {
+                        self.parent.onEscapeDown()
+                        return nil
+                    }
+                }
+                
+                return event
+            }
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            parent.text = textView.string
+        }
+    }
+}
+
+// MARK: - Native Custom Text Field Wrapper
 
 struct CustomMacTextField: NSViewRepresentable {
     @Binding var text: String
@@ -403,6 +700,7 @@ struct CustomMacTextField: NSViewRepresentable {
     var onUpArrow: () -> Void
     var onShiftDownArrow: () -> Void
     var onShiftUpArrow: () -> Void
+    var onCmdShiftToggle: () -> Void
     var onDeleteKey: () -> Void
     var onSubmit: () -> Void
 
@@ -437,6 +735,8 @@ struct CustomMacTextField: NSViewRepresentable {
                 currentEditor.setSelectedRange(NSRange(location: currentEditor.selectedRange().location, length: 0))
             }
         }
+        
+        context.coordinator.setupLocalMonitor(for: nsView)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -445,9 +745,34 @@ struct CustomMacTextField: NSViewRepresentable {
 
     class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: CustomMacTextField
+        private var localMonitor: Any?
 
         init(_ parent: CustomMacTextField) {
             self.parent = parent
+        }
+        
+        deinit {
+            if let monitor = localMonitor {
+                NSEvent.removeMonitor(monitor)
+            }
+        }
+        
+        func setupLocalMonitor(for textField: NSTextField) {
+            guard localMonitor == nil else { return }
+            
+            localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self = self, textField.currentEditor() != nil else { return event }
+                
+                let flags = event.modifierFlags
+                if flags.contains(.command) && flags.contains(.shift) {
+                    let keyCode = event.keyCode
+                    if keyCode == 126 || keyCode == 125 {
+                        self.parent.onCmdShiftToggle()
+                        return nil
+                    }
+                }
+                return event
+            }
         }
 
         func controlTextDidChange(_ obj: Notification) {
@@ -456,7 +781,6 @@ struct CustomMacTextField: NSViewRepresentable {
             }
         }
 
-        // INTERCEPTING APP-KIT SELECTORS: Bypasses standard text selection for structural shifts
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.moveDown(_:)) {
                 parent.onDownArrow()
@@ -484,7 +808,7 @@ struct CustomMacTextField: NSViewRepresentable {
     }
 }
 
-// MARK: - Native Windows Blurry Glass Layer Bridge
+// MARK: - Native Windows Layer Visual Bridge
 
 struct VisualEffectBlur: NSViewRepresentable {
     var material: NSVisualEffectView.Material
@@ -501,5 +825,13 @@ struct VisualEffectBlur: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
         nsView.material = material
         nsView.blendingMode = blendingMode
+    }
+}
+
+extension View {
+    func onPlaySound() -> some View {
+        self.onReceive(NotificationCenter.default.publisher(for: .requestHotkeyPinToggle)) { _ in
+            NSSound(named: "Submarine")?.play()
+        }
     }
 }
