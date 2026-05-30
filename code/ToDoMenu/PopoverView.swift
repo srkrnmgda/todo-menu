@@ -75,18 +75,22 @@ struct TaskPopoverView: View {
                                     isEditingEnabled: clearedTaskIds.contains(task.id),
                                     onDownArrow: {
                                         commitInlineEdit(id: task.id)
-                                        handleRowArrowMove(direction: .down, currentIndex: index)
+                                        handleRowArrowMove(direction: .down, currentTaskId: task.id)
                                     },
                                     onUpArrow: {
                                         commitInlineEdit(id: task.id)
-                                        handleRowArrowMove(direction: .up, currentIndex: index)
+                                        handleRowArrowMove(direction: .up, currentTaskId: task.id)
                                     },
                                     // Shift + Arrow arrangement event hooks
                                     onShiftDownArrow: {
-                                        moveTaskDelta(fromIndex: index, direction: .down)
+                                        if let currentIndex = store.tasks.firstIndex(where: { $0.id == task.id }) {
+                                            moveTaskDelta(fromIndex: currentIndex, direction: .down)
+                                        }
                                     },
                                     onShiftUpArrow: {
-                                        moveTaskDelta(fromIndex: index, direction: .up)
+                                        if let currentIndex = store.tasks.firstIndex(where: { $0.id == task.id }) {
+                                            moveTaskDelta(fromIndex: currentIndex, direction: .up)
+                                        }
                                     },
                                     onDeleteKey: {
                                         deleteAndMoveSelection(task)
@@ -136,9 +140,8 @@ struct TaskPopoverView: View {
                         }
                     }
                 }
-                // Listen for focus changes and center the target node instantly
-                .onChange(of: selectedTaskId) { newId in
-                    if let targetId = newId {
+                .onChange(of: selectedTaskId) { oldValue, newValue in
+                    if let targetId = newValue {
                         withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
                             proxy.scrollTo(targetId, anchor: .center)
                         }
@@ -288,7 +291,12 @@ struct TaskPopoverView: View {
         }
     }
 
-    private func handleRowArrowMove(direction: MoveCommandDirection, currentIndex: Int) {
+    private func handleRowArrowMove(direction: MoveCommandDirection, currentTaskId: UUID) {
+        // Resolve index dynamically from the data state directly, rather than passing a static ForEach value
+        guard let currentIndex = store.tasks.firstIndex(where: { $0.id == currentTaskId }) else {
+            return
+        }
+
         switch direction {
         case .down:
             if currentIndex == store.tasks.count - 1 {
@@ -315,6 +323,8 @@ struct TaskPopoverView: View {
     
     // Handles Shift + Arrow structural indexing mutations safely
     private func moveTaskDelta(fromIndex: Int, direction: MoveCommandDirection) {
+        guard fromIndex >= 0 && fromIndex < store.tasks.count else { return }
+
         let toIndex: Int
         if direction == .down {
             toIndex = fromIndex + 1
@@ -340,24 +350,38 @@ struct TaskPopoverView: View {
     
     private func deleteAndMoveSelection(_ task: Task) {
         guard let index = store.tasks.firstIndex(where: { $0.id == task.id }) else { return }
+        
+        // 1. HARD RESIGN APPKIT FOCUS: Clear responders safely
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        focusedField = nil
+        
         taskTexts.removeValue(forKey: task.id)
         clearedTaskIds.remove(task.id)
         
+        // 2. Derive the fallback focus destination ahead of mutating the collection
+        let nextTargetId: UUID?
         if store.tasks.count <= 1 {
-            selectedTaskId = nil
-            focusedField = .inputField
+            nextTargetId = nil
         } else if index == store.tasks.count - 1 {
-            let targetId = store.tasks[index - 1].id
-            selectedTaskId = targetId
-            focusedField = .row(id: targetId)
+            nextTargetId = store.tasks[index - 1].id
         } else {
-            let targetId = store.tasks[index + 1].id
-            selectedTaskId = targetId
-            focusedField = .row(id: targetId)
+            nextTargetId = store.tasks[index + 1].id
         }
         
+        // 3. Perform removal mutation smoothly inside the animation engine
         withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
             store.delete(task)
+        }
+        
+        // 4. Delay the target focus assignment to the next event loop run tick
+        DispatchQueue.main.async {
+            if let targetId = nextTargetId {
+                self.selectedTaskId = targetId
+                self.focusedField = .row(id: targetId)
+            } else {
+                self.selectedTaskId = nil
+                self.focusedField = .inputField
+            }
         }
     }
 }
@@ -429,7 +453,7 @@ struct CustomMacTextField: NSViewRepresentable {
             nsView.stringValue = text
         }
         
-        // 🌟 Clear active textual highlighting selections upon rendering re-arranged indices
+        // Clear active textual highlighting selections upon rendering re-arranged indices
         if let currentEditor = nsView.currentEditor() as? NSTextView {
             if currentEditor.selectedRange().length > 0 {
                 currentEditor.setSelectedRange(NSRange(location: currentEditor.selectedRange().location, length: 0))
@@ -455,7 +479,6 @@ struct CustomMacTextField: NSViewRepresentable {
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            // 🌟 Dynamic Selector lookups explicitly bypassing static class-member requirements
             if commandSelector == #selector(NSResponder.moveDown(_:)) {
                 parent.onDownArrow()
                 return true
